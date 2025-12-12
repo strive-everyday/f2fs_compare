@@ -211,6 +211,8 @@ struct seg_entry {
 
 struct sec_entry {
 	unsigned int valid_blocks;	/* # of valid blocks in a section */
+	/* === [新增] === */
+    unsigned int erase_count;   /* 记录该 Section (Zone) 的擦除次数 */
 };
 
 #define MAX_SKIP_GC_COUNT			16
@@ -261,6 +263,9 @@ struct free_segmap_info {
 	spinlock_t segmap_lock;		/* free segmap lock */
 	unsigned long *free_segmap;	/* free segment bitmap */
 	unsigned long *free_secmap;	/* free section bitmap */
+	/* === [新增 2] 寿命耗尽位图 (1=已坏, 0=健康) === */
+    unsigned long *bad_secmap;
+    /* =========================================== */
 };
 
 /* Notice: The order of dirty type is same with CURSEG_XXX in f2fs.h */

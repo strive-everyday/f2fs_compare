@@ -1676,6 +1676,10 @@ struct f2fs_sb_info {
 
 	struct f2fs_mount_info mount_opt;	/* mount options */
 
+	/* === [新增] 坏块计数器 === */
+    atomic_t bad_section_count;           /* 统计原生 F2FS 产生的坏块/错误块数量 */
+    /* ======================= */
+
 	/* for cleaning operations */
 	struct f2fs_rwsem gc_lock;		/*
 						 * semaphore for GC, avoid

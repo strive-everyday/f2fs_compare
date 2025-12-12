@@ -26,6 +26,9 @@
 #include <trace/events/f2fs.h>
 
 #define __reverse_ffz(x) __reverse_ffs(~(x))
+#define FEMU_ACCEL_FACTOR  2
+#define MAX_ERASE_LIMIT 300
+
 
 static struct kmem_cache *discard_entry_slab;
 static struct kmem_cache *discard_cmd_slab;
@@ -168,6 +171,42 @@ found:
 	return result - size + __reverse_ffz(tmp);
 }
 
+//qgc 增加磨损计数逻辑
+static void update_and_check_wear(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+    struct free_segmap_info *free_i = FREE_I(sbi);
+    /* 获取 Section Entry */
+    struct sec_entry *sec = get_sec_entry(sbi, segno);
+    unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
+
+    if (!sec) return;
+
+    /* 1. 增加磨损计数 */
+    sec->erase_count+= FEMU_ACCEL_FACTOR;
+
+    /* 2. 检查是否到达极限 */
+    if (sec->erase_count >= MAX_ERASE_LIMIT) {
+        /* 如果还没标记，就标记为坏块 */
+        if (!test_and_set_bit(secno, free_i->bad_secmap)) {
+            /* === [修改开始] === */
+            
+            /* 原子增加计数器，并获取增加后的值 */
+            int current_count = atomic_inc_return(&sbi->bad_section_count);
+
+            /* 打印单条坏块日志 */
+            printk(KERN_INFO "[F2FS] Section %u reached limit (%u). Marked as BAD. (Total: %d)\n", 
+                   secno, sec->erase_count, current_count);
+
+            /* 每满 10 个坏块，打印一次汇总日志 */
+            if (current_count % 10 == 0) {
+                printk(KERN_INFO "[F2FS-Wear] 累计坏块数达到 %d 个！当前 Segno: %u\n", 
+                       current_count, segno);
+            }
+            
+            /* === [修改结束] === */
+        }
+    }
+}
 bool f2fs_need_SSR(struct f2fs_sb_info *sbi)
 {
 	int node_secs = get_blocktype_secs(sbi, F2FS_DIRTY_NODES);
@@ -1250,6 +1289,11 @@ static void __submit_zone_reset_cmd(struct f2fs_sb_info *sbi,
 	bio->bi_iter.bi_sector = SECTOR_FROM_BLOCK(dc->di.start);
 	bio->bi_private = dc;
 	bio->bi_end_io = f2fs_submit_discard_endio;
+	/* === qgc [新增] 更新磨损计数 === */
+	update_and_check_wear(sbi, GET_SEGNO(sbi, dc->di.lstart));
+	// printk(KERN_DEBUG "[F2FS-WL] ZNS Reset on dev %s, Seg %u\n", 
+    //                dc->bdev->bd_disk->disk_name, GET_SEGNO(sbi, dc->di.lstart));
+    // /* ========================== */
 	submit_bio(bio);
 
 	atomic_inc(&dcc->issued_discard);
@@ -2720,6 +2764,15 @@ static int get_new_segment(struct f2fs_sb_info *sbi,
 
 find_other_zone:
 	secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
+	/* === [新增] 坏块过滤器 (位图加速版) === */
+    /* 只要找到的 secno 在 bad_secmap 里是 1，就继续找下一个空闲块 */
+    while (secno < MAIN_SECS(sbi) && 
+           test_bit(secno, free_i->bad_secmap)) {
+        
+        /* 关键优化：不需要 i++ 慢慢找，直接用 find_next 飞跃 */
+        secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), secno + 1);
+    }
+    /* ====================================== */
 
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (secno >= MAIN_SECS(sbi) && f2fs_sb_has_blkzoned(sbi)) {
@@ -2727,9 +2780,17 @@ find_other_zone:
 		if (sbi->blkzone_alloc_policy == BLKZONE_ALLOC_ONLY_SEQ) {
 			hint = GET_SEC_FROM_SEG(sbi, first_zoned_segno(sbi));
 			secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
-		} else
+		} else{
 			secno = find_first_zero_bit(free_i->free_secmap,
 								MAIN_SECS(sbi));
+							}
+		/* ================= [这里必须补上检查！] ================= */
+        while (secno < MAIN_SECS(sbi) && 
+               test_bit(secno, free_i->bad_secmap)) {
+            secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), secno + 1);
+        }
+        /* ====================================================== */
+						
 		if (secno >= MAIN_SECS(sbi)) {
 			ret = -ENOSPC;
 			f2fs_bug_on(sbi, 1);
@@ -2741,6 +2802,12 @@ find_other_zone:
 	if (secno >= MAIN_SECS(sbi)) {
 		secno = find_first_zero_bit(free_i->free_secmap,
 							MAIN_SECS(sbi));
+		/* ================= [这里也必须补上检查！] ================= */
+        while (secno < MAIN_SECS(sbi) && 
+               test_bit(secno, free_i->bad_secmap)) {
+            secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), secno + 1);
+        }
+        /* ====================================================== */
 		if (secno >= MAIN_SECS(sbi)) {
 			ret = -ENOSPC;
 			f2fs_bug_on(sbi, 1);
@@ -4747,6 +4814,12 @@ static int build_free_segmap(struct f2fs_sb_info *sbi)
 	if (!free_i->free_secmap)
 		return -ENOMEM;
 
+	/* === qgc [新增] 分配 bad_secmap === */
+    free_i->bad_secmap = f2fs_kvzalloc(sbi, sec_bitmap_size, GFP_KERNEL);
+    if (!free_i->bad_secmap)
+        return -ENOMEM;
+    /* ============================= */
+
 	/* set all segments as dirty temporarily */
 	memset(free_i->free_segmap, 0xff, bitmap_size);
 	memset(free_i->free_secmap, 0xff, sec_bitmap_size);
@@ -5473,6 +5546,9 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 	if (!sm_info)
 		return -ENOMEM;
 
+	/* === [新增] 初始化坏块计数器 === */
+    atomic_set(&sbi->bad_section_count, 0);
+    /* =========================== */
 	/* init sm info */
 	sbi->sm_info = sm_info;
 	sm_info->seg0_blkaddr = le32_to_cpu(raw_super->segment0_blkaddr);
@@ -5601,6 +5677,9 @@ static void destroy_free_segmap(struct f2fs_sb_info *sbi)
 	SM_I(sbi)->free_info = NULL;
 	kvfree(free_i->free_segmap);
 	kvfree(free_i->free_secmap);
+	/* === qgc [新增] 释放 bad_secmap === */
+    kvfree(free_i->bad_secmap);
+    /* ============================= */
 	kfree(free_i);
 }
 
